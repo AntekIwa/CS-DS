@@ -11,7 +11,7 @@ FILE2=$2
 
 # Sprawdzenie, czy jq jest zainstalowane
 if ! command -v jq &> /dev/null; then
-    echo "Błąd: Narzędzie 'jq' nie jest zainstalowane. Zainstaluj je (np. apt install jq)."
+    echo "Błąd: Narzędzie 'jq' nie jest zainstalowane."
     exit 1
 fi
 
