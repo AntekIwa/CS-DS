@@ -10,8 +10,8 @@ check_disk_health() {
 
     # if=...        -> plik wejściowy (urządzenie)
     # of=/dev/null  -> plik wyjściowy (kosz, nigdzie nie zapisujemy)
-    # bs=4M         -> wielkość bloku (przyspiesza odczyt)
-    # status=progress -> pokazuje pasek postępu
+    # bs=4M         -> wielkość bloku 
+    # status=progress -> pasek postępu
     # conv=noerror,sync -> najważniejsze flagi!
     #    noerror: nie przerywamy przy błędzie odczytu (chcemy znaleźć wszystkie błędy)
     #    sync: uzupełnij błędne bloki zerami (dla zachowania ciągłości)
