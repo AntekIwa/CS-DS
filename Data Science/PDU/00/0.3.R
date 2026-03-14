@@ -1,0 +1,5 @@
+x <- c(-1, 2.1, NA, 7)
+sum(x, na.rm = TRUE)
+x <- c(-1, 2.1, NA, 1/0, 0/0, log(-1), sqrt(-1), 2.1^(-4.1))
+is.finite(x)
+sum(x[is.finite(x)])
