@@ -23,13 +23,16 @@ typedef struct {
 
 struct rstack {
     size_t ref_count; // calkowita liczba referencji
-    size_t internal_count; // referencje pochodzace z wewnatrz innych stosow
+    size_t internal_count; // referencje z wewnatrz innych stosow
     size_t capacity; // pojemnosc
     size_t size; // rozmiar
     elem_t *elements; // tablica elementow
 
     bool marked; // flaga dla garbage collector
-    uint64_t visit_mark; //  czy odwiedzony (funkcje przeszukujace)
+    bool writing_in_progress; // flaga O(1) do cykli przy zapisie
+    uint64_t visit_mark; // czy odwiedzony (funkcje przeszukujace)
+
+    struct rstack *gc_next; // lista robocza dla O(N) gc
     struct rstack *prev; // wskazniki przod tyl na globalnej liscie
     struct rstack *next;
 };
@@ -37,33 +40,40 @@ struct rstack {
 static rstack_t *global_stacks = nullptr;
 static uint64_t current_visit_mark = 0;
 
-// garbage collector - mark and sweep
+// garbage collector - mark and sweep w czasie O(N)
 static void run_garbage_collection(void) {
     rstack_t *curr = global_stacks;
+    rstack_t *worklist = nullptr;
+
+    // 1. odznacz wszystkie i znajdz korzenie
     while (curr) {
         curr->marked = false;
+        if (curr->ref_count > curr->internal_count) {
+            curr->marked = true;
+            curr->gc_next = worklist;
+            worklist = curr;
+        }
         curr = curr->next;
     }
 
-    bool changed;
-    do {
-        changed = false;
-        for (curr = global_stacks; curr; curr = curr->next) {
-            if (!curr->marked && curr->ref_count > curr->internal_count) {
-                curr->marked = true;
-                changed = true;
-            }
-            if (curr->marked) {
-                for (size_t i = 0; i < curr->size; i++) {
-                    if (curr->elements[i].type == ELEM_RSTACK && !curr->elements[i].data.rs->marked) {
-                        curr->elements[i].data.rs->marked = true;
-                        changed = true;
-                    }
+    // 2. liniowe przejscie grafu (zamiast O(N^2))
+    while (worklist) {
+        rstack_t *node = worklist;
+        worklist = node->gc_next;
+
+        for (size_t i = 0; i < node->size; i++) {
+            if (node->elements[i].type == ELEM_RSTACK) {
+                rstack_t *child = node->elements[i].data.rs;
+                if (!child->marked) {
+                    child->marked = true;
+                    child->gc_next = worklist;
+                    worklist = child;
                 }
             }
         }
-    } while (changed);
+    }
 
+    // 3. usuwanie referencji z martwych stosow
     curr = global_stacks;
     while (curr) {
         if (!curr->marked) {
@@ -77,6 +87,7 @@ static void run_garbage_collection(void) {
         curr = curr->next;
     }
 
+    // 4. usuwanie martwych z pamieci
     curr = global_stacks;
     rstack_t *prev = nullptr;
     while (curr) {
@@ -102,6 +113,7 @@ static void run_garbage_collection(void) {
 
 
 // funkcje dla stosow
+// tworzy nowy pusty stos i wrzuca go na liste
 rstack_t* rstack_new(void) {
     rstack_t* rs = malloc(sizeof(rstack_t));
     if (rs == nullptr) {
@@ -113,26 +125,32 @@ rstack_t* rstack_new(void) {
     rs->size = 0;
     rs->capacity = 0;
     rs->elements = nullptr;
-    rs->marked = false;
-    rs->visit_mark = 0;
-    rs->prev = nullptr;
 
+    rs->marked = false;
+    rs->writing_in_progress = false;
+    rs->visit_mark = 0;
+    rs->gc_next = nullptr;
+
+    rs->prev = nullptr;
     rs->next = global_stacks;
     if (global_stacks) global_stacks->prev = rs;
     global_stacks = rs;
     return rs;
 }
 
+// zmniejsza licznik referencji stosu
 void rstack_delete(rstack_t* rs) {
     if (rs == nullptr) return;
     rs->ref_count--;
     run_garbage_collection();
 }
 
+// podwaja tablice elementow w razie potrzeby
 static int ensure_capacity(rstack_t* rs) {
     if (rs->capacity > rs->size) return 0;
     size_t new_capacity = (rs->capacity == 0) ? 4 : 2 * rs->capacity;
-    elem_t *new_elements = reallocarray(rs->elements, new_capacity, sizeof(elem_t));
+    elem_t *new_elements = reallocarray(rs->elements, new_capacity,
+                                        sizeof(elem_t));
     if (new_elements == nullptr) {
         errno = ENOMEM;
         return -1;
@@ -142,6 +160,7 @@ static int ensure_capacity(rstack_t* rs) {
     return 0;
 }
 
+// wrzuca zwykla liczbe na stos
 int rstack_push_value(rstack_t* rs, uint64_t value) {
     if (rs == nullptr) { errno = EINVAL; return -1; }
     if (ensure_capacity(rs) == -1) return -1;
@@ -151,6 +170,7 @@ int rstack_push_value(rstack_t* rs, uint64_t value) {
     return 0;
 }
 
+// wrzuca wewnetrzny stos na stos i uaktualnia refy
 int rstack_push_rstack(rstack_t* rs, rstack_t* other) {
     if (rs == nullptr || other == nullptr) {
         errno = EINVAL;
@@ -165,6 +185,7 @@ int rstack_push_rstack(rstack_t* rs, rstack_t* other) {
     return 0;
 }
 
+// zdejmuje z wierzcholka
 void rstack_pop(rstack_t* rs) {
     if (rs == nullptr || rs->size == 0) return;
     elem_t top_elem = rs->elements[rs->size - 1];
@@ -177,28 +198,34 @@ void rstack_pop(rstack_t* rs) {
 }
 
 
-//rstack empty
+// rstack empty
+// sprawdza rekurencyjnie zawartosc galezi omijajac cykle
 static bool rstack_empty_recursive(rstack_t* rs, uint64_t mark) {
     if (rs == nullptr || rs->size == 0) return true;
     if (rs->visit_mark == mark) return true;
     rs->visit_mark = mark;
     for (size_t i = 0; i < rs->size; i++) {
         if (rs->elements[i].type == ELEM_RSTACK) {
-            if (!rstack_empty_recursive(rs->elements[i].data.rs, mark)) return false;
+            if (!rstack_empty_recursive(rs->elements[i].data.rs, mark)) {
+                return false;
+            }
         }
         else if (rs->elements[i].type == ELEM_VALUE) return false;
     }
     return true;
 }
 
+// zewnetrzny interfejs rstack_empty
 bool rstack_empty(rstack_t* rs) {
     if (rs == nullptr) return true;
     current_visit_mark++;
     return rstack_empty_recursive(rs, current_visit_mark);
 }
 
-//rstack front
-static bool rstack_front_recursive(rstack_t *rs, uint64_t mark, uint64_t *found_value) {
+// rstack front
+// szuka z wierzcholka w glab uzywajac rekurencji
+static bool rstack_front_recursive(rstack_t *rs, uint64_t mark,
+                                   uint64_t *found_value) {
     if (rs == nullptr || rs->size == 0) return false;
     if (rs->visit_mark == mark) return false;
     rs->visit_mark = mark;
@@ -209,58 +236,63 @@ static bool rstack_front_recursive(rstack_t *rs, uint64_t mark, uint64_t *found_
             return true;
         }
         else if (elem->type == ELEM_RSTACK) {
-            if (rstack_front_recursive(elem->data.rs, mark, found_value)) return true;
+            if (rstack_front_recursive(elem->data.rs, mark, found_value)) {
+                return true;
+            }
         }
     }
     return false;
 }
 
+// zewnetrzny interfejs rstack_front
 result_t rstack_front(rstack_t *rs) {
     result_t result = { .flag = false, .value = 0 };
     if (rs == nullptr) return result;
     current_visit_mark++;
-    if (rstack_front_recursive(rs, current_visit_mark, &result.value)) result.flag = true;
+    if (rstack_front_recursive(rs, current_visit_mark, &result.value)) {
+        result.flag = true;
+    }
     return result;
 }
 
 // read & write z plikami
-typedef struct call_path {
-    rstack_t *rs;
-    struct call_path *prev;
-} call_path_t;
-
-static bool check_cycle(call_path_t *path, rstack_t *target) {
-    while (path != nullptr) {
-        if (path->rs == target) return true;
-        path = path->prev;
-    }
-    return false;
-}
-
-static bool rstack_write_recursive(rstack_t *rs, FILE *file, call_path_t *path) {
+// wnetrze write z szybka flaga do ciec
+static bool rstack_write_recursive(rstack_t *rs, FILE *file) {
     if (rs == nullptr || rs->size == 0) return false;
-    if (check_cycle(path, rs)) return true;
-    call_path_t current_path = { .rs = rs, .prev = path };
+    if (rs->writing_in_progress) return true; // uciecie cyklu
+
+    rs->writing_in_progress = true;
+
     for (size_t i = 0; i < rs->size; i++) {
         elem_t *elem = &rs->elements[i];
         if (elem->type == ELEM_VALUE) {
-            if (fprintf(file, "%" PRIu64 "\n", elem->data.value) < 0) return true;
+            if (fprintf(file, "%" PRIu64 "\n", elem->data.value) < 0) {
+                rs->writing_in_progress = false;
+                return true;
+            }
         } else if (elem->type == ELEM_RSTACK) {
-            if (rstack_write_recursive(elem->data.rs, file, &current_path)) return true;
+            if (rstack_write_recursive(elem->data.rs, file)) {
+                rs->writing_in_progress = false;
+                return true;
+            }
         }
     }
+
+    rs->writing_in_progress = false; // powrot ze sciezki
     return false;
 }
 
+// otwiera i zamyka plik, zapisuje od dolu stosu
 int rstack_write(char const *path, rstack_t *rs) {
     if (path == nullptr || rs == nullptr) { errno = EINVAL; return -1; }
     FILE *f = fopen(path, "w");
     if (f == nullptr) return -1;
-    rstack_write_recursive(rs, f, nullptr);
+    rstack_write_recursive(rs, f);
     if (fclose(f) == EOF) return -1;
     return 0;
 }
 
+// czyta liczby i sklada w calosc weryfikujac wejscie
 rstack_t *rstack_read(char const *path) {
     if (path == nullptr) {
         errno = EINVAL;
